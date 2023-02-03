@@ -14,8 +14,10 @@
 # limitations under the License.
 
 import copy
+import inspect
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -205,7 +207,125 @@ class ConfigTester(object):
             errors = "\n".join([f"- {v[0]}: got {v[1]} instead of {v[2]}" for v in wrong_values])
             raise ValueError(f"The following keys were not properly set in the config:\n{errors}")
 
-    def run_common_tests(self):
+    def _check_attribute_being_used(self, attributes, default_value, modeling_sources, check_fn=None):
+
+        attribute_used = False
+        for attribute in attributes:
+            for modeling_source in modeling_sources:
+                # check if we can find `config.xxx`, `getattr(config, "xxx", ...)` or `getattr(self.config, "xxx", ...)`
+                if (
+                    f"config.{attribute}" in modeling_source
+                    or f'getattr(config, "{attribute}"' in modeling_source
+                    or f'getattr(self.config, "{attribute}"' in modeling_source
+                ):
+                    attribute_used = True
+                # Deal with multi-line cases
+                elif (
+                    re.search(rf'getattr[ \t\v\n\r\f]*\([ \t\v\n\r\f]*config, "{attribute}"', modeling_source)
+                    is not None
+                ):
+                    attribute_used = True
+                elif (
+                    re.search(rf'getattr[ \t\v\n\r\f]*\([ \t\v\n\r\f]*self.config, "{attribute}"', modeling_source)
+                    is not None
+                ):
+                    attribute_used = True
+                elif attribute in [
+                    "summary_type",
+                    "summary_use_proj",
+                    "summary_activation",
+                    "summary_last_dropout",
+                    "summary_proj_to_labels",
+                    "summary_first_dropout",
+                ]:
+                    if "SequenceSummary" in modeling_source:
+                        attribute_used = True
+                if attribute_used:
+                    break
+            if attribute_used:
+                break
+
+        attributes_to_allow = [
+            "bos_index",
+            "eos_index",
+            "pad_index",
+            "unk_index",
+            "mask_index",
+            "image_size",
+            "use_cache",
+        ]
+
+        attributes_used_in_generation = ["encoder_no_repeat_ngram_size"]
+
+        # Special cases to be allowed
+        case_allowed = True
+        if not attribute_used:
+            case_allowed = False
+            for attribute in attributes:
+
+                # Allow if the default value in the configuration class is different from the one in `PretrainedConfig`
+                if attribute in ["is_encoder_decoder"] and default_value is True:
+                    case_allowed = True
+                elif attribute in ["tie_word_embeddings"] and default_value is False:
+                    case_allowed = True
+
+                # Allow cases without checking the default value in the configuration class
+                elif attribute in attributes_to_allow + attributes_used_in_generation:
+                    case_allowed = True
+                elif attribute.endswith("_token_id"):
+                    case_allowed = True
+
+                # configuration class specific cases
+                if not case_allowed and check_fn is not None:
+                    case_allowed = check_fn(attribute, self.config_class)
+
+        return attribute_used or case_allowed
+
+    def check_config_attributes_being_used(self, check_fn=None):
+
+        signature = dict(inspect.signature(self.config_class.__init__).parameters)
+        parameter_names = [x for x in list(signature.keys()) if x not in ["self", "kwargs"]]
+        parameter_defaults = [signature[param].default for param in parameter_names]
+
+        reversed_attribute_map = {}
+        if len(self.config_class.attribute_map) > 0:
+            reversed_attribute_map = {v: k for k, v in self.config_class.attribute_map.items()}
+
+        config_source_file = inspect.getsourcefile(self.config_class)
+        model_dir = os.path.dirname(config_source_file)
+
+        # Let's check against all frameworks: as long as one framework uses an attribute, we are good.
+        # Actually, let's check all modeling files in the same modeling directory, as
+        modeling_paths = [os.path.join(model_dir, fn) for fn in os.listdir(model_dir) if fn.startswith("modeling_")]
+
+        modeling_sources = []
+        for path in modeling_paths:
+            if os.path.isfile(path):
+                with open(path) as fp:
+                    modeling_sources.append(fp.read())
+
+        unused_attributes = []
+        for config_param, default_value in zip(parameter_names, parameter_defaults):
+            attributes = [config_param]
+            # some configuration classes have non-empty `attribute_map`, and both names could be used in the
+            # corresponding modeling files. As long as one of them appears, it is fine.
+            if config_param in reversed_attribute_map:
+                attributes.append(reversed_attribute_map[config_param])
+            if not self._check_attribute_being_used(attributes, default_value, modeling_sources, check_fn=check_fn):
+                unused_attributes.append(attributes[0])
+
+        if len(unused_attributes) > 0:
+            raise ValueError(
+                f"The following attributes of `{self.config_class.__name__}` (or its variant names) is/are not used in"
+                f" the modeling files: {unused_attributes}"
+            )
+
+    def run_common_tests(self, **kwargs):
+
+        check_attribute_usage_fn = kwargs.pop("check_attribute_usage_fn", None)
+        if len(kwargs) > 0:
+            raise ValueError(f"`kwargs` contain unused keys: {list(kwargs.keys())}")
+
         self.create_and_test_config_common_properties()
         self.create_and_test_config_to_json_string()
         self.create_and_test_config_to_json_file()
@@ -214,6 +334,7 @@ class ConfigTester(object):
         self.create_and_test_config_with_num_labels()
         self.check_config_can_be_init_without_params()
         self.check_config_arguments_init()
+        self.check_config_attributes_being_used(check_fn=check_attribute_usage_fn)
 
 
 @is_staging_test

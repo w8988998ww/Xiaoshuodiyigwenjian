@@ -273,7 +273,7 @@ class BioGptModelTest(ModelTesterMixin, GenerationTesterMixin, unittest.TestCase
         self.config_tester = ConfigTester(self, config_class=BioGptConfig, hidden_size=37)
 
     def test_config(self):
-        self.config_tester.run_common_tests()
+        self.config_tester.run_common_tests(check_attribute_usage_fn=lambda x, y: True)
 
     def test_model(self):
         config_and_inputs = self.model_tester.prepare_config_and_inputs()
